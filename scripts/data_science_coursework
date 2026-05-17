@@ -1,0 +1,328 @@
+---
+title: "Data Science Coursework"
+output: html_notebook
+---
+
+# ==============================================================================
+# R-SCRIPT
+# Topic: Demographic Change, Migration, and Labour Market Outcomes in Germany
+# Author: Jakhongir Shirinov
+# ==============================================================================
+
+# Loading libraries
+```{r}
+library(tidyverse)
+library(dplyr)
+library(readr)
+#library(wiesbaden)
+```
+
+
+```{r}
+#Setting the working directory
+setwd("C:/Users/jak24294/OneDrive - Fraunhofer/Komo - The")
+```
+
+
+# Importing the datasets from GENESIS-Online
+# Datasets with the code 12711-0008 for Migration Data, and 13311-0001 for Employment Data.
+```{r}
+#Migration Data (Table 12711-0008)
+mig_raw <- read_delim("12711-0008_en.csv", 
+                      delim = ";", 
+                      skip = 9, 
+                      col_names = FALSE,
+                      locale = locale(encoding = "latin1"))
+
+
+# 4. CLEANING & AGGREGATING EU MIGRATION (2000-2024)
+# I use the position of the columns (1, and 12) to avoid name errors
+# I group here by year rather than different EU countries. Why? Because our employment data (13311-0001) is a "Total Germany" figure. To run a regression, the "X" and "Y" must match. If our "Y" is "Total German Employment," our "X" must be "Total EU Migration to Germany" as well. If we had separated each country it would be a problem because we don't have the "Outcome" (Y) variable for each country (at least i could not find such an elaborate data). i.e. We know how many Poles moved to Germany, but we don't know exactly how many of those specific Poles are working versus how many Italians are working in the same yearly dataset.
+
+eu_migration_clean <- mig_raw %>%
+  
+  select(Label = 1, Net_Mig_Raw = 12) %>%
+  
+  # Here I have to identify rows that are Years (i.e. 4 digits)
+  mutate(Is_Year = str_detect(Label, "^\\d{4}$")) %>%
+  mutate(Year_Column = ifelse(Is_Year, Label, NA)) %>%
+  
+  
+  fill(Year_Column) %>%
+  
+  # Removong the header rows and metadata
+  filter(!Is_Year) %>%
+  filter(!is.na(Label)) %>%
+  
+  # No need for 'e' flags either
+  mutate(Net_Mig = as.numeric(str_remove_all(Net_Mig_Raw, "[^0-9.-]"))) %>%
+  
+  # Aggregating to get the annual EU stream size
+  group_by(Year = as.numeric(Year_Column)) %>%
+  summarize(Total_EU_Net_Migration = sum(Net_Mig, na.rm = TRUE))
+
+```
+
+
+# Importing Employment Data (Table 13311-0001)
+
+```{r}
+emp_raw <- read_delim("13311-0001_en.csv", 
+                      delim = ";", 
+                      skip = 6, 
+                      col_names = FALSE,
+                      col_types = cols(.default = "c"), 
+                      locale = locale(encoding = "latin1"))
+
+
+# Cleaning part:
+employment_clean <- emp_raw %>%
+  
+  filter(X2 == "Total") %>%
+  select(paste0("X", seq(5, 73, by = 2))) %>%
+  
+  # We want here the years to be in rows, not columns
+  pivot_longer(cols = everything(), names_to = "orig_col", values_to = "Raw_Val") %>%
+  
+  # Again, removing 'e' flags and assigning the Year
+  mutate(
+    Employment_Total = as.numeric(str_remove_all(Raw_Val, "[^0-9.-]")),
+    Year = 1991:2025
+  ) %>%
+  
+  # We have to filter the year to match our 2000-2024 Migration data range
+  filter(Year >= 2000 & Year <= 2024) %>%
+  select(Year, Employment_Total)
+```
+
+# The final merge (Creating the Regression Dataset)
+# Now we have a clean, 25-row dataset where each year from 2000 to 2024 is matched with its specific Net EU Migration and Total Employment in Germany.
+
+```{r}
+final_data <- inner_join(eu_migration_clean, employment_clean, by = "Year")
+```
+
+# Visualization: MIGRATION vs. EMPLOYMENT
+
+```{r}
+ggplot(final_data, aes(x = Total_EU_Net_Migration, y = Employment_Total)) +
+  geom_point(color = "blue", size = 3) +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  labs(title = "Correlation: EU Net Migration and German Employment (2000-2024)",
+       x = "Net Migration from EU",
+       y = "Total Persons in Employment (in 1000s)",
+       caption = "Source: Destatis Tables 12711-0008 & 13311-0001") +
+  theme_minimal()
+```
+
+
+# Model 1: The OLS Regression.
+
+
+
+```{r}
+model <- lm(Employment_Total ~ Total_EU_Net_Migration, data = final_data)
+summary(model)
+
+# If we look at our summary table the pure effect of Total_EU_Net_Migration in the column Pr(>|t|), p-value shows 0.0825 which is a significant value. It Suggests that a link exists (but it could be weak or delayed). Thus we isolate time effect in the next model.
+
+# Because both mifration and employment have been generally increasing since 2000, the current model, perhaps, might be suffering from a "Time Trend" (i.e. they both go up because time passes, not necessarily just because of each other).
+```
+
+
+# Model 2: The Time Trend 
+
+
+```{r}
+# Adding a Time Trend by creating a simple index (1, 2, 3...) to represent the passing years
+final_data2 <- final_data %>%
+  mutate(time_trend = row_number())
+
+model_refined <- lm(Employment_Total ~ Total_EU_Net_Migration + time_trend, data = final_data2)
+summary(model_refined)
+
+# While a simple OLS model suggests a positive correlation between EU migration and employment, adding a time trend reveals that the primary driver of total employment growth is a long-term structural trend. Migration acts as a supportive factor, but its year-on-year fluctuations do not solely dictate total labor market outcomes.
+
+# The Control variable revealed to us that the effect of Migration became insignificant indicating very small p = 0.874.
+
+# To prove that the effect of Migration has no effect in employment in the same year the Migrants arrived we should look at Differences (Growth Rates) rather than Levels (Totals). 
+
+```
+
+# Model 3: The Differences (delta)
+
+
+```{r}
+# We look at the year-over-year change (delta)
+final_data_diff <- final_data %>%
+  arrange(Year) %>%
+  mutate(diff_employment = Employment_Total - lag(Employment_Total),
+         diff_migration = Total_EU_Net_Migration - lag(Total_EU_Net_Migration))
+
+model_diff <- lm(diff_employment ~ diff_migration, data = final_data_diff)
+
+summary(model_diff)
+
+
+# And it gave us a p-value of 0.953 meaning there is almost zero statistical correlation between the year-to-year change in EU migration and the year-to-year change in total German employment.
+
+# Many reasons might be responsible for that for example: When a migrant arrives in January, they don't always appear in the employment statistics in the same year. They might take 6–12 months to learn the language, recognize their degrees, or find the right job.
+
+#The "Replacement" Effect: Germany has a massive demographic problem (the "aging workforce"). Every year, hundreds of thousands of Germans retire. EU migration might just be filling the holes left by retirees rather than creating brand-new "extra" jobs. If 100,000 Germans retire and 100,000 EU migrants start working, total employment stays at zero growth, even though migration was high.
+```
+
+# Model 4: The Lagged OLS
+
+
+```{r}
+final_data_lag <- final_data %>%
+  arrange(Year) %>%
+  mutate(Net_Mig_Lag = lag(Total_EU_Net_Migration))
+
+model_lag <- lm(Employment_Total ~ Net_Mig_Lag, data = final_data_lag)
+
+summary(model_lag)
+
+# Once we found out that Migration does not effect Labour Market of Germany on the same year, we want to Test if last year's migration affects this year's employment (quite interesting observation). 
+
+# This is where the term 'Lag' comes. Lagged explanatory variables are commonly used in empirical labour economics to capture delayed adjustment processes in labour markets. The lag accounts for the time required for labour market integration. There is typically a structural delay between the arrival of migrants and their entry into formal employment in a new country. 
+
+# The model surprisingky gave us a p-value of 0.00835. Since in statistics anything below 0.01 is considered "highly significant" we can say that by lagging the variable, we have proven a logical economic theory: Migrants do not contribute to the workforce the day (or even 'year') they arrive, but they have a powerful impact on the labor market one year later. 
+```
+
+
+# Plotting the Relationships
+
+
+
+```{r}
+ggplot(final_data_lag, aes(x = Net_Mig_Lag, y = Employment_Total)) +
+  geom_point(color = "darkgreen", size = 3) +
+  geom_smooth(method = "lm", color = "blue", fill = "lightblue") +
+  labs(title = "The Impact of EU Migration (Lagged) on German Employment",
+       subtitle = "Relationship between Net Migration at t-1 and Employment at t (2000-2024)",
+       x = "Net EU Migration (Previous Year)",
+       y = "Total Persons in Employment (1,000s)",
+       caption = " ") +
+  theme_bw()
+
+ggsave("scatter_plot.png", width = 8, height = 5)
+```
+
+
+# Comparing Specific Countries 
+
+
+
+```{r}
+country_comparison <- mig_raw %>%
+  select(Label = X1, Net_Mig_Raw = X12) %>%
+  mutate(Label = trimws(Label)) %>%
+  mutate(Is_Year = str_detect(Label, "^\\d{4}$")) %>%
+  mutate(Year = ifelse(Is_Year, Label, NA)) %>%
+  fill(Year) %>%
+  # Filter for the specific countries we want to compare (I took only "Poland", "Italy", "Romania", "Bulgaria", "Ireland", "Spain" for clarity)
+  #filter(Label %in% c("Poland", "Italy", "Romania", "Bulgaria")) %>%
+  filter(Label %in% c("Poland", "Italy", "Romania", "Bulgaria", "Ireland", "Spain")) %>%
+  #filter(Label %in% c("Belgium", "Bulgaria", "Denmark", "Estonia", "Finland", "France", "Croatia", "Slovenia", "Greece", "Ireland", "Italy", "Latvia", "Lithuania", "Luxembourg", "Malta", "Netherlands", "Austria", "Poland", "Portugal", "Romania", "Slovakia", "Sweden", "Spain", "Czechia", "Hungary", "Cyprus")) %>%
+  mutate(Net_Mig = as.numeric(str_remove_all(Net_Mig_Raw, "[^0-9.-]"))) %>%
+  mutate(Year = as.numeric(Year)) %>%
+  filter(Year >= 2000)
+
+# Plotting the Comparison
+ggplot(country_comparison, aes(x = Year, y = Net_Mig, color = Label)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  labs(title = "Net Migration to Germany: Country Comparison (2000-2024)",
+       x = "Year",
+       y = "Net Migration Balance",
+       color = "Country") +
+  theme_minimal()
+
+ggsave("indiv_lines.png", width = 8, height = 5)
+```
+
+
+
+# Regional Comparison (Eastern vs. Southern vs. Northern EU)
+
+
+```{r}
+#The plot above does not show all the countries in order to avoid a "spaghetti ball," bbut rather we can group the countries.
+
+
+# Defining groups to capture the 'waves' of migration
+eastern_eu <- c("Poland", "Romania", "Bulgaria", "Hungary", "Czechia", "Slovakia", "Lithuania", "Latvia", "Estonia", "Slovenia")
+southern_eu <- c("Italy", "Spain", "Greece", "Portugal", "Croatia")
+northern_western_eu <- c("France", "Netherlands", "Austria", "Belgium", "Denmark", "Sweden", "Finland", "Ireland", "Luxembourg")
+
+regional_data <- mig_raw %>%
+  select(Label = X1, Net_Mig_Raw = X12) %>%
+  mutate(Label = trimws(Label)) %>%
+  mutate(Is_Year = str_detect(Label, "^\\d{4}$")) %>%
+  mutate(Year = ifelse(Is_Year, Label, NA)) %>%
+  fill(Year) %>%
+  
+  mutate(Region = case_when(
+    Label %in% eastern_eu ~ "Eastern EU",
+    Label %in% southern_eu ~ "Southern EU",
+    Label %in% northern_western_eu ~ "Northern/Western EU",
+    TRUE ~ "Other/Non-Categorized"
+  )) %>%
+  
+  filter(Region != "Other/Non-Categorized") %>%
+  mutate(Net_Mig = as.numeric(str_remove_all(Net_Mig_Raw, "[^0-9.-]")),
+         Year = as.numeric(Year)) %>%
+  # .groups = 'drop' silences the regrouping message
+  group_by(Year, Region) %>%
+  summarize(Total_Net_Mig = sum(Net_Mig, na.rm = TRUE), .groups = 'drop')
+
+
+ggplot(regional_data, aes(x = Year, y = Total_Net_Mig, color = Region)) +
+  geom_line(linewidth = 1.2) + 
+  geom_point(alpha = 0.5) +
+  labs(title = "EU Migration to Germany by Region (2000-2024)",
+       subtitle = "Comparing the impact of different EU expansion waves",
+       x = "Year", y = "Net Migration Balance",
+       caption = "") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+
+
+ggsave("3_groups.png", width = 8, height = 5)
+```
+
+
+# The "Growth Effect" plot (Index 2000 = 100)
+
+
+```{r}
+
+growth_data <- final_data %>%
+  arrange(Year) %>%
+  mutate(
+    
+    Employment_Index = (Employment_Total / Employment_Total[1]) * 100,
+    Migration_Index = (Total_EU_Net_Migration / Total_EU_Net_Migration[1]) * 100
+  ) %>%
+  select(Year, Employment_Index, Migration_Index) %>%
+  pivot_longer(cols = -Year, names_to = "Variable", values_to = "Index")
+
+ggplot(growth_data, aes(x = Year, y = Index, color = Variable)) +
+  geom_line(linewidth = 1.5) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "black") +
+  labs(title = "Relative Growth: EU Migration vs. German Employment",
+       subtitle = "Index (Year 2000 = 100). How migration outpaces employment growth.",
+       x = "Year", y = "Growth Index (100 = Baseline)",
+       caption = "") +
+  theme_minimal() +
+  scale_color_manual(values = c("darkblue", "darkorange"), 
+                     labels = c("Total Employment", "Net EU Migration"))
+
+ggsave("Figure_1_Relative_growth.png", width = 8, height = 5)
+
+# We can see how the Orange Line (Migration) stays below the blue line until about 2011, then skyrockets!
+
+
+```
+
